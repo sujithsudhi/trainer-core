@@ -441,11 +441,12 @@ def train_one_epoch(model         : nn.Module,
     amp_enabled = _is_amp_enabled(config, device)
 
     accum_steps = max(config.gradient_accumulation_steps, 1)
-    total_loss = 0.0
+    total_loss = torch.zeros((), device=device)
     total_examples = 0
     total_tokens = 0
     total_steps = 0
     start_time = time.perf_counter()
+    last_logged_loss: Optional[float] = None
 
     iterator, progress_bar = _progress_iter(dataloader, progress_desc or "Train")
     try:
@@ -483,7 +484,7 @@ def train_one_epoch(model         : nn.Module,
 
                 optimizer.zero_grad(set_to_none=True)
 
-            total_loss += loss.item()
+            total_loss = total_loss + loss.detach()
             total_examples += batch_adapter.count_batch_items(raw_batch)
             total_tokens += batch_adapter.count_tokens(inputs)
             total_steps += 1
@@ -498,12 +499,15 @@ def train_one_epoch(model         : nn.Module,
                 state.loss = loss.detach()
             _notify_callbacks(resolved_callbacks, "on_batch_end", state)
             if progress_bar is not None:
-                elapsed = max(time.perf_counter() - start_time, 1e-8)
-                progress_bar.set_postfix(
-                    {"loss": f"{loss.item():.4f}",
-                     "tok/s": f"{int(total_tokens / elapsed):,}"},
-                    refresh=False,
-                )
+                should_log = step == 1 or step % config.log_interval == 0
+                if should_log:
+                    elapsed = max(time.perf_counter() - start_time, 1e-8)
+                    last_logged_loss = float(loss.detach().item())
+                    progress_bar.set_postfix(
+                        {"loss": f"{last_logged_loss:.4f}",
+                         "tok/s": f"{int(total_tokens / elapsed):,}"},
+                        refresh=False,
+                    )
     finally:
         if progress_bar is not None:
             progress_bar.close()
@@ -521,9 +525,10 @@ def train_one_epoch(model         : nn.Module,
         optimizer.zero_grad(set_to_none=True)
 
     elapsed = max(time.perf_counter() - start_time, 1e-8)
+    total_loss_value = float(total_loss.item())
     metrics = {
-        "loss"     : total_loss / max(total_steps, 1),
-        "loss_sum" : total_loss,
+        "loss"     : total_loss_value / max(total_steps, 1),
+        "loss_sum" : total_loss_value,
         "batches"  : total_steps,
         "examples" : total_examples,
         "tokens"   : total_tokens,
