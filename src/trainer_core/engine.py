@@ -35,6 +35,7 @@ _TRAINING_DEFAULTS: Dict[str, Any] = {
     "gradient_clip_norm"           : None,
     "gradient_accumulation_steps"  : 1,
     "use_amp"                      : "auto",
+    "amp_dtype"                    : "auto",
     "log_interval"                 : 50,
     "non_blocking"                 : True,
     "early_stopping_patience"      : 10,
@@ -157,6 +158,26 @@ def _resolve_use_amp(value: Any) -> bool:
     return resolved and torch.cuda.is_available()
 
 
+def _resolve_amp_dtype(value: Any) -> str:
+    if value is None:
+        value = _TRAINING_DEFAULTS.get("amp_dtype", "auto")
+    if isinstance(value, torch.dtype):
+        if value == torch.float16:
+            return "float16"
+        if value == torch.bfloat16:
+            return "bfloat16"
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"", "auto", "fp16", "float16", "half"}:
+            return "float16"
+        if lowered in {"bf16", "bfloat16"}:
+            return "bfloat16"
+    raise ValueError(
+        "amp_dtype must be one of auto, fp16, float16, bf16, bfloat16, "
+        "torch.float16, or torch.bfloat16."
+    )
+
+
 def _default_epochs() -> int:
     return _resolve_positive_int(_TRAINING_DEFAULTS.get("epochs"), 5)
 
@@ -175,6 +196,10 @@ def _default_gradient_accumulation_steps() -> int:
 
 def _default_use_amp() -> bool:
     return _resolve_use_amp(_TRAINING_DEFAULTS.get("use_amp"))
+
+
+def _default_amp_dtype() -> str:
+    return _resolve_amp_dtype(_TRAINING_DEFAULTS.get("amp_dtype"))
 
 
 def _default_log_interval() -> int:
@@ -220,6 +245,7 @@ class TrainingConfig:
     gradient_clip_norm           : float | None       = field(default_factory=_default_gradient_clip_norm)
     gradient_accumulation_steps  : int                = field(default_factory=_default_gradient_accumulation_steps)
     use_amp                      : bool | str | None  = field(default_factory=_default_use_amp)  # type: ignore[assignment]
+    amp_dtype                    : str | torch.dtype | None = field(default_factory=_default_amp_dtype)
     log_interval                 : int                = field(default_factory=_default_log_interval)
     non_blocking                 : bool               = field(default_factory=_default_non_blocking)
     early_stopping_patience      : int | None         = field(default_factory=_default_early_stopping_patience)
@@ -238,6 +264,7 @@ class TrainingConfig:
             self.gradient_accumulation_steps, 1
         )
         self.use_amp = _resolve_use_amp(self.use_amp)
+        self.amp_dtype = _resolve_amp_dtype(self.amp_dtype)
         self.log_interval = _resolve_positive_int(self.log_interval, 50)
         self.non_blocking = _resolve_bool(self.non_blocking, True)
         self.early_stopping_patience = _resolve_early_stopping_patience(
@@ -276,6 +303,7 @@ def load_training_config(
         "gradient_clip_norm",
         "gradient_accumulation_steps",
         "use_amp",
+        "amp_dtype",
         "log_interval",
         "non_blocking",
         "early_stopping_patience",
@@ -288,6 +316,24 @@ def load_training_config(
     }
     kwargs = {key: payload.get(key) for key in valid_keys}
     return TrainingConfig(**kwargs)
+
+
+def _is_amp_enabled(config: TrainingConfig, device: torch.device) -> bool:
+    return bool(config.use_amp) and device.type == "cuda" and torch.cuda.is_available()
+
+
+def _autocast_dtype(config: TrainingConfig) -> torch.dtype:
+    if config.amp_dtype == "bfloat16":
+        return torch.bfloat16
+    return torch.float16
+
+
+def _is_grad_scaling_enabled(config: TrainingConfig, device: torch.device) -> bool:
+    return _is_amp_enabled(config, device) and _autocast_dtype(config) == torch.float16
+
+
+def _create_grad_scaler(config: TrainingConfig, device: torch.device) -> GradScaler:
+    return GradScaler(enabled=_is_grad_scaling_enabled(config, device))
 
 
 def _notify_callbacks(
@@ -391,7 +437,8 @@ def train_one_epoch(model         : nn.Module,
     model.to(device)
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    scaler = scaler or GradScaler(enabled=config.use_amp and torch.cuda.is_available())
+    scaler = scaler or _create_grad_scaler(config, device)
+    amp_enabled = _is_amp_enabled(config, device)
 
     accum_steps = max(config.gradient_accumulation_steps, 1)
     total_loss = 0.0
@@ -405,7 +452,13 @@ def train_one_epoch(model         : nn.Module,
         for step, raw_batch in enumerate(iterator, start=1):
             batch = batch_adapter.move_to_device(raw_batch, device, config.non_blocking)
             inputs, targets = batch_adapter.split_batch(batch)
-            with autocast(device_type=device.type, enabled=scaler.is_enabled()):
+            autocast_kwargs: Dict[str, Any] = {
+                "device_type": device.type,
+                "enabled": amp_enabled,
+            }
+            if amp_enabled:
+                autocast_kwargs["dtype"] = _autocast_dtype(config)
+            with autocast(**autocast_kwargs):
                 outputs = batch_adapter.forward_model(model, inputs)
                 loss = loss_fn(outputs, targets)
                 loss_to_backward = loss / accum_steps
@@ -590,7 +643,7 @@ class Trainer:
         self.val_loader   = val_loader
         self.config       = config
         self.scheduler    = scheduler
-        self.scaler = GradScaler(enabled=config.use_amp and torch.cuda.is_available())
+        self.scaler = _create_grad_scaler(config, self.device)
         self.history: list[Dict[str, Any]] = []
         self.batch_adapter = batch_adapter or _DEFAULT_BATCH_ADAPTER
         self.callbacks = normalize_callbacks(callbacks=callbacks, logger=logger)
