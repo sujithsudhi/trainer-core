@@ -1,8 +1,8 @@
-﻿"""Thin config exports for the starter trainer-core package."""
+"""Thin config exports for the starter trainer-core package."""
 
 from .engine import TrainingConfig, load_training_config
 
-TrainerConfig = TrainingConfig
+TrainerConfig       = TrainingConfig
 load_trainer_config = load_training_config
 
 __all__ = [
