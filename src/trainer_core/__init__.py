@@ -5,6 +5,7 @@ from .callbacks import Callback, CallableLoggerCallback, TrainerState, normalize
 from .checkpointing import CheckpointManager, load_checkpoint, save_checkpoint
 from .config import TrainingConfig, TrainerConfig, load_training_config, load_trainer_config
 from .engine import Trainer, evaluate, fit, train_one_epoch
+from .exporting import export_inference_artifact
 
 __all__ = [
     "BatchAdapter",
@@ -25,4 +26,5 @@ __all__ = [
     "train_one_epoch",
     "evaluate",
     "fit",
+    "export_inference_artifact",
 ]
